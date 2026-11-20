@@ -194,3 +194,4 @@ if (color_comp == vk::ComponentSwizzle::eIdentity)
 }
 
 } // namespace vkutil
+
