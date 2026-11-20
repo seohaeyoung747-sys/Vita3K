@@ -171,6 +171,9 @@ vk::ComponentMapping color_to_texture_swizzle(const vk::ComponentMapping &swizzl
 
     for (int i = 0; i < 4; i++) {
         vk::ComponentSwizzle component = texture[i];
+        if (component == vk::ComponentSwizzle::eIdentity)
+    component = static_cast<vk::ComponentSwizzle>(VK_COMPONENT_SWIZZLE_R + i);
+
         int component_val = static_cast<int>(component);
         if (component_val < VK_COMPONENT_SWIZZLE_R) {
             result[i] = component;
@@ -178,7 +181,11 @@ vk::ComponentMapping color_to_texture_swizzle(const vk::ComponentMapping &swizzl
             result[i] = vk::ComponentSwizzle::eZero;
             // look in the color swizzle if there is a component writing to the same channel
             for (int j = 0; j < 4; j++) {
-                if (component == color[j])
+                vk::ComponentSwizzle color_comp = color[j];
+if (color_comp == vk::ComponentSwizzle::eIdentity)
+    color_comp = static_cast<vk::ComponentSwizzle>(VK_COMPONENT_SWIZZLE_R + j);
+
+                if (component == color_comp)
                     result[i] = static_cast<vk::ComponentSwizzle>(VK_COMPONENT_SWIZZLE_R + j);
             }
         }
