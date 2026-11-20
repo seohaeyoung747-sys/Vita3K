@@ -205,57 +205,195 @@ COMMAND(handle_transfer_copy) {
     const SceGxmTransferFormat dst_fmt = images[1].format;
     SceGxmTransferType src_type = helper.pop<SceGxmTransferType>();
     SceGxmTransferType dst_type = helper.pop<SceGxmTransferType>();
-
-    if (src_fmt != dst_fmt) {
-        LOG_ERROR_ONCE("Unhandled format conversion from 0x{:0X} to 0x{:0X}", fmt::underlying(src_fmt), fmt::underlying(dst_fmt));
-        delete[] images;
-        return;
-    }
-
-    if (colorKeyMode != SCE_GXM_TRANSFER_COLORKEY_NONE && src_fmt != SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR) {
-        LOG_ERROR_ONCE("Transfer copy with non-zero key mask not handled for format 0x{:0X}", fmt::underlying(src_fmt));
-    }
-
     vulkan::CallbackRequestFunction copy_operation = [=, &mem]() {
-        const SceGxmTransferImage &src = images[0];
-        const SceGxmTransferImage &dst = images[1];
+        const SceGxmTransferImage src = *images;
+        const SceGxmTransferImage dst = *(images + 1);
 
-        // Get bits per pixel of the image
-        const uint32_t bpp = gxm::get_bits_per_pixel(src.format);
+        if (src_fmt == dst_fmt) {
+            const uint32_t bpp = gxm::get_bits_per_pixel(src.format);
+            switch (bpp) {
+            case 8:
+                perform_transfer_copy_mode<uint8_t>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask, colorKeyMode);
+                break;
+            case 16:
+                perform_transfer_copy_mode<uint16_t>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask, colorKeyMode);
+                break;
+            case 24:
+                perform_transfer_copy_src_type<std::array<uint8_t, 3>, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
+                break;
+            case 32:
+                perform_transfer_copy_mode<uint32_t>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask, colorKeyMode);
+                break;
+            case 64:
+                perform_transfer_copy_src_type<uint64_t, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
+                break;
+            case 128:
+                perform_transfer_copy_src_type<std::array<uint64_t, 2>, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
+                break;
+            }
+            delete[] images;
+            return;
+        }
 
-        // use a specialized function for each type (more optimized)
-        switch (bpp) {
-        case 8:
-            perform_transfer_copy_src_type<uint8_t, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
-            break;
-        case 16:
-            perform_transfer_copy_src_type<uint16_t, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
-            break;
-        case 24:
-            perform_transfer_copy_src_type<std::array<uint8_t, 3>, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
-            break;
-        case 32:
-            perform_transfer_copy_mode<uint32_t>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask, colorKeyMode);
-            break;
-        case 64:
-            perform_transfer_copy_src_type<uint64_t, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
-            break;
-        case 128:
-            perform_transfer_copy_src_type<std::array<uint64_t, 2>, SCE_GXM_TRANSFER_COLORKEY_NONE>(mem, src, dst, src_type, dst_type, colorKeyValue, colorKeyMask);
-            break;
+        const uint8_t *src_ptr = src.address.cast<uint8_t>().get(mem);
+        uint8_t *dst_ptr = dst.address.cast<uint8_t>().get(mem);
+        if (!src_ptr || !dst_ptr || src.width == 0 || src.height == 0) {
+            delete[] images;
+            return;
+        }
+
+        const int64_t src_bpp_bytes = gxm::get_bits_per_pixel(src_fmt) / 8;
+        const int64_t dst_bpp_bytes = gxm::get_bits_per_pixel(dst_fmt) / 8;
+
+        auto calc_offset = [](uint32_t x, uint32_t y, const SceGxmTransferImage &img, SceGxmTransferType type, int64_t pixel_bytes) -> int64_t {
+            if (type == SCE_GXM_TRANSFER_LINEAR) {
+                return y * static_cast<int64_t>(img.stride) + x * pixel_bytes;
+            } else if (type == SCE_GXM_TRANSFER_TILED) {
+                const int64_t stride_pixel = img.stride / pixel_bytes;
+                const uint32_t texel_in_tile = ((y % 32) * 32) + (x % 32);
+                const int64_t tile_addr = (stride_pixel / 32) * (y / 32) + (x / 32);
+                return (tile_addr * 1024 + texel_in_tile) * pixel_bytes;
+            } else {
+                return texture::encode_morton(x, y, img.width, img.height) * pixel_bytes;
+            }
+        };
+
+        auto expand_bits = [](uint32_t v, int bits) -> uint8_t {
+            if (bits == 8) return static_cast<uint8_t>(v);
+            if (bits == 6) return static_cast<uint8_t>((v << 2) | (v >> 4));
+            if (bits == 5) return static_cast<uint8_t>((v << 3) | (v >> 2));
+            if (bits == 4) return static_cast<uint8_t>((v << 4) | v);
+            if (bits == 2) return static_cast<uint8_t>(v * 85);
+            if (bits == 1) return v ? 255 : 0;
+            return static_cast<uint8_t>(v);
+        };
+
+        struct RGBA { uint8_t r, g, b, a; };
+
+        auto read_pixel = [&](const uint8_t *p, uint32_t &raw_val) -> RGBA {
+            raw_val = 0;
+            switch (src_fmt) {
+            case SCE_GXM_TRANSFER_FORMAT_U8_R:
+                raw_val = *p;
+                return { *p, 0, 0, 255 };
+            case SCE_GXM_TRANSFER_FORMAT_U4U4U4U4_ABGR: {
+                uint16_t v;
+                memcpy(&v, p, 2);
+                raw_val = v;
+                return { expand_bits(v & 0xF, 4), expand_bits((v >> 4) & 0xF, 4), expand_bits((v >> 8) & 0xF, 4), expand_bits((v >> 12) & 0xF, 4) };
+            }
+            case SCE_GXM_TRANSFER_FORMAT_U1U5U5U5_ABGR: {
+                uint16_t v;
+                memcpy(&v, p, 2);
+                raw_val = v;
+                return { expand_bits(v & 0x1F, 5), expand_bits((v >> 5) & 0x1F, 5), expand_bits((v >> 10) & 0x1F, 5), expand_bits((v >> 15) & 0x1, 1) };
+            }
+            case SCE_GXM_TRANSFER_FORMAT_U5U6U5_BGR: {
+                uint16_t v;
+                memcpy(&v, p, 2);
+                raw_val = v;
+                return { expand_bits(v & 0x1F, 5), expand_bits((v >> 5) & 0x3F, 6), expand_bits((v >> 11) & 0x1F, 5), 255 };
+            }
+            case SCE_GXM_TRANSFER_FORMAT_U8U8_GR:
+                raw_val = *p | (static_cast<uint32_t>(*(p + 1)) << 8);
+                return { *p, *(p + 1), 0, 255 };
+            case SCE_GXM_TRANSFER_FORMAT_U8U8U8_BGR:
+                raw_val = *p | (static_cast<uint32_t>(*(p + 1)) << 8) | (static_cast<uint32_t>(*(p + 2)) << 16);
+                return { *p, *(p + 1), *(p + 2), 255 };
+            case SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR:
+                memcpy(&raw_val, p, 4);
+                return { *p, *(p + 1), *(p + 2), *(p + 3) };
+            case SCE_GXM_TRANSFER_FORMAT_U2U10U10U10_ABGR:
+                memcpy(&raw_val, p, 4);
+                return { static_cast<uint8_t>((raw_val & 0x3FF) >> 2), static_cast<uint8_t>(((raw_val >> 10) & 0x3FF) >> 2), static_cast<uint8_t>(((raw_val >> 20) & 0x3FF) >> 2), expand_bits((raw_val >> 30) & 0x3, 2) };
+            default:
+                LOG_ERROR_ONCE("Unhandled transfer source format 0x{:0X}", fmt::underlying(src_fmt));
+                return { 0, 0, 0, 255 };
+            }
+        };
+
+        auto write_pixel = [&](uint8_t *p, RGBA c) {
+            switch (dst_fmt) {
+            case SCE_GXM_TRANSFER_FORMAT_U8_R:
+                *p = c.r;
+                break;
+            case SCE_GXM_TRANSFER_FORMAT_U4U4U4U4_ABGR: {
+                uint16_t v = ((c.a >> 4) << 12) | ((c.b >> 4) << 8) | ((c.g >> 4) << 4) | (c.r >> 4);
+                memcpy(p, &v, 2);
+                break;
+            }
+            case SCE_GXM_TRANSFER_FORMAT_U1U5U5U5_ABGR: {
+                uint16_t v = ((c.a >> 7) << 15) | ((c.b >> 3) << 10) | ((c.g >> 3) << 5) | (c.r >> 3);
+                memcpy(p, &v, 2);
+                break;
+            }
+            case SCE_GXM_TRANSFER_FORMAT_U5U6U5_BGR: {
+                uint16_t v = ((c.b >> 3) << 11) | ((c.g >> 2) << 5) | (c.r >> 3);
+                memcpy(p, &v, 2);
+                break;
+            }
+            case SCE_GXM_TRANSFER_FORMAT_U8U8_GR:
+                *p = c.r;
+                *(p + 1) = c.g;
+                break;
+            case SCE_GXM_TRANSFER_FORMAT_U8U8U8_BGR:
+                *p = c.r;
+                *(p + 1) = c.g;
+                *(p + 2) = c.b;
+                break;
+            case SCE_GXM_TRANSFER_FORMAT_U8U8U8U8_ABGR:
+                *p = c.r;
+                *(p + 1) = c.g;
+                *(p + 2) = c.b;
+                *(p + 3) = c.a;
+                break;
+            case SCE_GXM_TRANSFER_FORMAT_U2U10U10U10_ABGR: {
+                uint32_t v = (static_cast<uint32_t>(c.a >> 6) << 30) | (static_cast<uint32_t>(c.b) << 22) | (static_cast<uint32_t>(c.g) << 12) | (static_cast<uint32_t>(c.r) << 2);
+                memcpy(p, &v, 4);
+                break;
+            }
+            default:
+                LOG_ERROR_ONCE("Unhandled transfer dest format 0x{:0X}", fmt::underlying(dst_fmt));
+                break;
+            }
+        };
+
+        std::vector<std::pair<RGBA, uint32_t>> snapshot(static_cast<size_t>(src.width) * src.height);
+        for (uint32_t dy = 0; dy < src.height; ++dy) {
+            for (uint32_t dx = 0; dx < src.width; ++dx) {
+                const int64_t s_off = calc_offset(src.x + dx, src.y + dy, src, src_type, src_bpp_bytes);
+                uint32_t raw_val = 0;
+                RGBA px = read_pixel(src_ptr + s_off, raw_val);
+                snapshot.at(static_cast<size_t>(dy) * src.width + dx) = { px, raw_val };
+            }
+        }
+
+        for (uint32_t dy = 0; dy < src.height; ++dy) {
+            for (uint32_t dx = 0; dx < src.width; ++dx) {
+                const auto &[px, raw_val] = snapshot.at(static_cast<size_t>(dy) * src.width + dx);
+                if (colorKeyMode == SCE_GXM_TRANSFER_COLORKEY_PASS) {
+                    if ((raw_val & colorKeyMask) != colorKeyValue)
+                        continue;
+                } else if (colorKeyMode == SCE_GXM_TRANSFER_COLORKEY_REJECT) {
+                    if ((raw_val & colorKeyMask) == colorKeyValue)
+                        continue;
+                }
+                const int64_t d_off = calc_offset(dst.x + dx, dst.y + dy, dst, dst_type, dst_bpp_bytes);
+                write_pixel(dst_ptr + d_off, px);
+            }
         }
 
         delete[] images;
     };
 
-    if (renderer.current_backend == Backend::Vulkan && renderer.features.enable_memory_mapping && !renderer.disable_surface_sync) {
-        if (dynamic_cast<vulkan::VKState &>(renderer).surface_cache.check_for_surface(mem, images[0].address.address(), copy_operation, images[1].address.address()))
-            // let the vulkan surface cache handle it
+        if (renderer.current_backend == Backend::Vulkan && renderer.features.enable_memory_mapping && !renderer.disable_surface_sync) {
+        if (dynamic_cast<vulkan::VKState &>(renderer).surface_cache.check_for_surface(mem, images->address.address(), copy_operation, (images + 1)->address.address()))
             return;
     }
 
     copy_operation();
 }
+
 
 COMMAND(handle_transfer_downscale) {
     TRACY_FUNC_COMMANDS(handle_transfer_downscale);
@@ -376,3 +514,4 @@ COMMAND(handle_transfer_fill) {
 }
 
 } // namespace renderer
+
